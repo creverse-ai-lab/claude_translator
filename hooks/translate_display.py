@@ -357,7 +357,11 @@ RETRY_HINT = (
 )
 
 
+THINK_RE = re.compile(r"<think>.*?(?:</think>|\Z)", re.DOTALL)
+
+
 def clean_output(text):
+    text = THINK_RE.sub("", text)      # reasoning models leak their thinking
     text = PREAMBLE_RE.sub("", text)
     text = re.sub(r"^```(?:markdown|md)?\s*\n(.*)\n```\s*$",
                   r"\1", text, flags=re.DOTALL)
