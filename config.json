@@ -1,7 +1,7 @@
 {
   "enabled": true,
   "ollama_url": "http://127.0.0.1:11434",
-  "model": "gemma3:1b",
+  "model": "gemma4:e2b",
   "keep_alive": "30m",
   "temperature": 0.0,
   "num_ctx": 4096,
