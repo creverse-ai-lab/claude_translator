@@ -1,0 +1,22 @@
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# 로컬 상태·로그 (실행 시 ~/.claude/message-display-translator/ 에 생기지만,
+# 혹시 저장소 안에 만들 경우 대비)
+*.log
+buffer/
+chunks/
+state
+
+# 로컬 설정 덮어쓰기용 (config.json 은 공유 기본값으로 커밋함)
+config.local.json
+
+# 편집기
+.vscode/
+.idea/
+*.swp

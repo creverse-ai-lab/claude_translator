@@ -1,0 +1,23 @@
+{
+  "enabled": true,
+  "ollama_url": "http://127.0.0.1:11434",
+  "model": "gemma4:e2b",
+  "keep_alive": "30m",
+  "temperature": 0.0,
+  "num_ctx": 4096,
+  "request_timeout_sec": 150,
+  "min_chars": 200,
+  "max_chunk_chars": 1200,
+  "min_chunk_chars": 400,
+  "parallel_chunks": 3,
+  "mark_chunks": false,
+  "keep_original": true,
+  "part_wait_sec": 3.0,
+  "debug": false,
+  "min_output_ratio": 0.6,
+  "max_retries": 1,
+  "mark_fallback": true,
+  "prompt_file": "prompt.en.md",
+  "collect_actions": true,
+  "actions_min": 2
+}
