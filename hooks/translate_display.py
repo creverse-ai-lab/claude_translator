@@ -39,6 +39,8 @@ def load_config():
         "ollama_url": "http://127.0.0.1:11434",
         "model": "gemma4:e2b",
         "prompt_file": "prompt.en.md",
+        "mode": "dispatch",        # dispatch: detect->micro-tasks->merge
+                                   # rewrite: legacy whole-chunk rewriting
         "keep_alive": "30m",
         "temperature": 0.0,
         "num_ctx": 8192,
@@ -179,6 +181,35 @@ FIXED_PHRASES = [
     (re.compile(r"를 진행했습니다"), "했습니다"),
 ]
 
+def _jong(ch):
+    """Final-consonant index of a Hangul syllable (0 = none, 8 = rieul)."""
+    return (ord(ch) - 0xAC00) % 28 if "가" <= ch <= "힣" else -1
+
+
+def _through_eul(m):
+    # "툴을 통해" -> "툴로" (rieul final), "본문을 통해" -> "본문으로"
+    ch = m.group(1)
+    return ch + ("로" if _jong(ch) == 8 else "으로")
+
+
+# ported from im-not-ai quick-rules (A-family translation-ese only; the
+# humanizing rules that REMOVE structure/parenthesized terms are the
+# opposite of this tool's goal and are deliberately not ported)
+PORTED_PHRASES = [
+    # A-2: "~를 통해" -> "~로" (조사 자동 선택, "통해서만" 같은 한정은 제외)
+    (re.compile(r"([가-힣])를 통해(?:서)?(?!서|만)"), r"\1로"),
+    (re.compile(r"([가-힣])을 통해(?:서)?(?!서|만)"), _through_eul),
+    # A-7: "X를 가지고 있다" -> "X가 있다"
+    (re.compile(r"([가-힣])를 가지고 있"), r"\1가 있"),
+    (re.compile(r"([가-힣])을 가지고 있"), r"\1이 있"),
+    # A-19: 이중 조사
+    (re.compile(r"([가-힣])에서의 "), r"\1에서 "),
+    (re.compile(r"([가-힣])으로의 "), r"\1으로 가는 "),
+    # D-3: 채움말
+    (re.compile(r"본질적으로,?\s*"), ""),
+    (re.compile(r"기본적으로,?\s*"), ""),
+]
+
 # a first sentence that says nothing - drop it and start at the conclusion
 FILLER_OPENER_RE = re.compile(
     r"^\s*(?:네[,.!]?\s*)?(?:조사해\s?봤습니다|확인해\s?봤습니다|확인했습니다|"
@@ -189,7 +220,7 @@ FILLER_OPENER_RE = re.compile(
 def apply_mechanical(text):
     text = FILLER_OPENER_RE.sub("", text, count=1)
     text = SHRINK_RE.sub(r"\1분의 1로\2\3", text)
-    for pat, rep in DOUBLE_PASSIVE + FIXED_PHRASES:
+    for pat, rep in DOUBLE_PASSIVE + FIXED_PHRASES + PORTED_PHRASES:
         text = pat.sub(rep, text)
     return text
 
@@ -238,6 +269,189 @@ def unmask_code(text, blocks):
                " 모아둡니다. 원문에서의 위치는 위 본문을 참고하세요.)\n\n"
         out += "\n\n".join(blocks[i] for i in missing)
     return out
+
+
+# ---------------------------------------------------- dispatch pipeline
+# The user-designed pipeline: Python detects what needs fixing, the small
+# LLM gets one tiny task per finding, and Python merges the results back.
+# The model never holds the whole text, so it can neither summarize nor
+# hallucinate structure - the failure modes we measured in whole-chunk mode.
+
+# bare-English term runs (code is already masked away at this point)
+ENG_RUN_RE = re.compile(
+    r"[A-Za-z][A-Za-z0-9+#.'-]*(?:[ -][A-Za-z][A-Za-z0-9+#.'-]*)*")
+
+# industry-standard tokens never worth translating (im-not-ai Do-NOT list)
+TERM_SKIP = {
+    "api", "cpu", "gpu", "ram", "llm", "gpt", "mcp", "sdk", "cli", "url",
+    "http", "https", "json", "yaml", "sql", "db", "id", "ui", "ux", "os",
+    "ci", "cd", "pr", "npm", "pip", "git", "ok",
+}
+
+SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+CONNECTIVE_RE = re.compile(r"(?:았|었|이|하)?(?:고|는데|아서|어서|으며|지만),?\s")
+
+
+def find_term_tasks(text):
+    """First occurrence of each bare English term worth glossing."""
+    tasks, seen = [], set()
+    for m in ENG_RUN_RE.finditer(text):
+        t = m.group(0)
+        words = t.split()
+        if len(t) < 4 and len(words) == 1:
+            continue                    # too short to be a term
+        if t.isupper():
+            continue                    # acronym - industry standard
+        if len(words) == 1 and (t[0].isupper() or t.lower() in TERM_SKIP):
+            continue                    # proper noun or standard token
+        if any(w.lower() in TERM_SKIP for w in words) and len(words) == 1:
+            continue
+        if text[max(0, m.start() - 1):m.start()] == "(":
+            continue                    # already glossed: 한국어(term)
+        key = t.lower()
+        if key in seen:
+            continue                    # B-1: gloss first occurrence only
+        seen.add(key)
+        tasks.append({"kind": "term", "start": m.start(), "end": m.end(),
+                      "src": t})
+    return tasks
+
+
+def find_sentence_tasks(text):
+    """Sentences that need model help: too long, or wrong register."""
+    total_formal = len(re.findall(r"니다[.!?]", text))
+    total_plain = len(re.findall(r"(?<!니)다[.!?]", text))
+    doc_formal = total_formal >= total_plain
+    tasks = []
+    for line_m in re.finditer(r"[^\n]+", text):
+        line = line_m.group(0)
+        if line.lstrip().startswith(("#", "|", ">", "-", "*")) or "[[CODE_" in line:
+            continue                    # keep structure lines verbatim
+        pos = line_m.start()
+        for sent in SENT_SPLIT_RE.split(line):
+            start = text.find(sent, pos)
+            pos = start + len(sent)
+            wants = []
+            if len(sent) >= 90 and len(CONNECTIVE_RE.findall(sent)) >= 2:
+                wants.append("뜻과 단어를 그대로 유지하며 2~3개의 문장으로 나눈다")
+            if doc_formal and re.search(r"(?<!니)다[.!?]\s*$", sent.strip()):
+                wants.append("문장 끝을 '~합니다'체로 바꾼다")
+            if wants:
+                tasks.append({"kind": "sent", "start": start,
+                              "end": start + len(sent), "src": sent,
+                              "wants": wants})
+    return tasks
+
+
+TERM_OUT_RE_T = r"^[가-힣0-9·, ]{1,30}\(%s\)$"
+
+
+def run_term_task(task):
+    out = call_ollama(
+        "너는 소프트웨어 기술 용어 번역기다. 주어진 영어 용어의 확립된 한국어 "
+        "번역어를 '한국어(영어원문)' 형식 한 줄로만 답한다. 확립된 번역어가 "
+        "없거나 확신이 없으면 영어 원문만 그대로 답한다. 설명을 붙이지 않는다.",
+        "용어: " + task["src"])
+    out = clean_output(out).strip().strip('"')
+    if out == task["src"]:
+        return None                     # model declined - keep original
+    if re.match(TERM_OUT_RE_T % re.escape(task["src"]), out):
+        return out
+    esc = re.escape(task["src"])
+    # salvage 1: the right answer buried in noise - "한국어(term)" anywhere
+    m = re.search(r"([가-힣][가-힣0-9· ]{0,29})\(%s\)" % esc, out)
+    if m and m.group(1).strip() != task["src"]:
+        return "%s(%s)" % (m.group(1).strip(), task["src"])
+    # salvage 2: reversed order - "term(한국어)"
+    m = re.match(r"%s\(([가-힣][가-힣0-9· ]{0,29})\)$" % esc, out)
+    if m:
+        return "%s(%s)" % (m.group(1).strip(), task["src"])
+    log("term task rejected %r -> %r" % (task["src"], out))
+    return None
+
+
+def run_sent_task(task):
+    out = call_ollama(
+        "너는 한국어 문장 교정기다. 지시받은 것만 고치고 다른 단어는 바꾸지 "
+        "않는다. 고친 문장만 출력한다. 설명을 붙이지 않는다.\n지시: "
+        + "; ".join(task["wants"]),
+        task["src"])
+    out = clean_output(out).strip()
+    if not out or missing_numbers(task["src"], out):
+        return None
+    ratio = len(out) / max(1, len(task["src"]))
+    if not 0.7 <= ratio <= 1.9:
+        log("sent task rejected (ratio %.2f): %r" % (ratio, task["src"][:40]))
+        return None
+    if re.search(r"\[\[\s*CODE_", task["src"]) and \
+            sorted(PLACEHOLDER_RE.findall(task["src"])) != \
+            sorted(PLACEHOLDER_RE.findall(out)):
+        return None
+    return out
+
+
+# particle pairs: (needs-batchim form, no-batchim form)
+PARTICLES = [("으로", "로"), ("이", "가"), ("을", "를"), ("은", "는"),
+             ("과", "와")]
+
+
+def fix_particle(text, pos):
+    """After replacing a span ending at pos, re-select the particle that
+    follows so it agrees with the new final Hangul syllable. For a glossed
+    term `한국어(term)` the syllable before the parenthesis governs."""
+    head = text[:pos]
+    base = re.sub(r"\([^()]*\)$", "", head)     # ignore the (원어) tail
+    if not base or not ("가" <= base[-1] <= "힣"):
+        return text
+    has_batchim = _jong(base[-1]) not in (0,)
+    rieul = _jong(base[-1]) == 8
+    for with_b, without_b in PARTICLES:
+        for cand in (with_b, without_b):
+            if text[pos:pos + len(cand)] != cand:
+                continue
+            if cand in ("으로", "로"):
+                right = "로" if (not has_batchim or rieul) else "으로"
+            else:
+                right = with_b if has_batchim else without_b
+            if cand != right:
+                return text[:pos] + right + text[pos + len(cand):]
+            return text
+    return text
+
+
+def apply_merges(text, results):
+    """Replace spans back into the text, last span first so offsets hold."""
+    for task, out in sorted(results, key=lambda r: -r[0]["start"]):
+        if out is None:
+            continue
+        text = text[:task["start"]] + out + text[task["end"]:]
+        if task["kind"] == "term":
+            text = fix_particle(text, task["start"] + len(out))
+    return text
+
+
+def run_wave(tasks, runner):
+    workers = max(1, min(int(CFG["parallel_chunks"]), len(tasks)))
+    if not tasks:
+        return []
+    if workers == 1:
+        outs = [runner(t) for t in tasks]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            outs = list(pool.map(runner, tasks))
+    return list(zip(tasks, outs))
+
+
+def translate_dispatch(text):
+    masked, blocks = mask_code(apply_mechanical(text))
+    terms = find_term_tasks(masked)
+    log("dispatch: %d term task(s): %s"
+        % (len(terms), [t["src"] for t in terms]))
+    masked = apply_merges(masked, run_wave(terms, run_term_task))
+    sents = find_sentence_tasks(masked)
+    log("dispatch: %d sentence task(s)" % len(sents))
+    masked = apply_merges(masked, run_wave(sents, run_sent_task))
+    return collect_actions(unmask_code(masked, blocks))
 
 
 # ------------------------------------------------------------- chunking
@@ -443,6 +657,8 @@ def translate_chunk(args):
 
 
 def translate(text):
+    if CFG["mode"] == "dispatch":
+        return translate_dispatch(text)
     system_prompt = read_prompt()
     masked, blocks = mask_code(apply_mechanical(text))
     chunks = split_chunks(masked, CFG["max_chunk_chars"],

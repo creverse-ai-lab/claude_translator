@@ -19,5 +19,6 @@
   "mark_fallback": true,
   "prompt_file": "prompt.en.md",
   "collect_actions": true,
-  "actions_min": 2
+  "actions_min": 2,
+  "mode": "dispatch"
 }
