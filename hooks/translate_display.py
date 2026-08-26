@@ -372,8 +372,8 @@ def find_sentence_tasks(text):
 
     for line_m in re.finditer(r"[^\n]+", text):
         line = line_m.group(0)
-        if "[[CODE_" in line:
-            continue
+        # inline-code placeholders travel inside the sentence; the per-task
+        # validator rejects any result that loses one, so no need to skip
         b = BULLET_RE.match(line)
         if b:                           # bullet: task the item body only
             scan(b.group(2), line_m.start() + len(b.group(1)))
@@ -442,7 +442,8 @@ def run_sent_task(task):
     cap = len(task["src"]) * 6 + 48
     out = call_ollama(
         "너는 한국어 문장 교정기다. 지시받은 것만 고치고 다른 단어는 바꾸지 "
-        "않는다. 고친 문장만 출력한다. 설명을 붙이지 않는다.\n지시: "
+        "않는다. [[CODE_숫자]] 표시는 그 자리에 그대로 둔다. 고친 문장만 "
+        "출력한다. 설명을 붙이지 않는다.\n지시: "
         + "; ".join(task["wants"]),
         task["src"], num_predict=cap)
     out = clean_output(out).strip()
