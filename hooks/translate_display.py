@@ -168,6 +168,10 @@ DOUBLE_PASSIVE = [
 
 # translationese with one fixed correct form - no judgement needed
 FIXED_PHRASES = [
+    (re.compile(r"존재하지 않습니다"), "없습니다"),
+    (re.compile(r"존재하지 않아"), "없어"),
+    (re.compile(r"존재하지 않(?=[으는고지])"), "없"),
+    (re.compile(r"(?<!로 )존재합니다"), "있습니다"),
     (re.compile(r"성공적으로\s+"), ""),
     (re.compile(r"귀하의\s*"), ""),
     (re.compile(r"필요에 따라"), "필요하면"),
