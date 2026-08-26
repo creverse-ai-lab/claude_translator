@@ -20,5 +20,6 @@
   "prompt_file": "prompt.en.md",
   "collect_actions": true,
   "actions_min": 2,
-  "mode": "dispatch"
+  "mode": "dispatch",
+  "parallel_tasks": 6
 }

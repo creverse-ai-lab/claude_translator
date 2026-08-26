@@ -49,6 +49,7 @@ def load_config():
         "max_chunk_chars": 1200,   # e2b handles small pieces far better
         "min_chunk_chars": 400,    # do not leave a lonely tail chunk
         "parallel_chunks": 3,      # chunks translated at the same time
+        "parallel_tasks": 6,       # concurrent micro-tasks (dispatch mode)
         "mark_chunks": False,      # draw a line where each chunk split
         "min_output_ratio": 0.6,   # reject a rewrite shorter than this
         "max_retries": 1,          # retries before keeping the original
@@ -317,29 +318,49 @@ def find_term_tasks(text):
     return tasks
 
 
+BULLET_RE = re.compile(r"^(\s*(?:[-*]|\d+\.)\s+)(.*)$")
+
+
 def find_sentence_tasks(text):
-    """Sentences that need model help: too long, or wrong register."""
-    total_formal = len(re.findall(r"니다[.!?]", text))
-    total_plain = len(re.findall(r"(?<!니)다[.!?]", text))
+    """Units that need model help: too-long sentences, wrong register.
+    Bullets are units of their own - one task per item is ~5x faster than
+    sending the whole list, and a bad result spoils one item, not the list."""
+    # register is judged on prose only: bullets are often terse-style
+    # (개조식) even in a polite document, and must not flip the verdict
+    prose = "\n".join(ln for ln in text.split("\n")
+                      if not BULLET_RE.match(ln))
+    total_formal = len(re.findall(r"니다[.!?]", prose))
+    total_plain = len(re.findall(r"(?<!니)다[.!?]", prose))
     doc_formal = total_formal >= total_plain
     tasks = []
-    for line_m in re.finditer(r"[^\n]+", text):
-        line = line_m.group(0)
-        if line.lstrip().startswith(("#", "|", ">", "-", "*")) or "[[CODE_" in line:
-            continue                    # keep structure lines verbatim
-        pos = line_m.start()
-        for sent in SENT_SPLIT_RE.split(line):
-            start = text.find(sent, pos)
+
+    def scan(body, offset):
+        pos = 0
+        for sent in SENT_SPLIT_RE.split(body):
+            start = body.find(sent, pos)
             pos = start + len(sent)
             wants = []
             if len(sent) >= 90 and len(CONNECTIVE_RE.findall(sent)) >= 2:
-                wants.append("뜻과 단어를 그대로 유지하며 2~3개의 문장으로 나눈다")
+                wants.append("뜻과 단어와 시제를 그대로 유지하며 "
+                             "2~3개의 문장으로 나눈다")
             if doc_formal and re.search(r"(?<!니)다[.!?]\s*$", sent.strip()):
-                wants.append("문장 끝을 '~합니다'체로 바꾼다")
+                wants.append("시제는 유지하고 문장 끝만 '~합니다'체로 바꾼다")
             if wants:
-                tasks.append({"kind": "sent", "start": start,
-                              "end": start + len(sent), "src": sent,
+                tasks.append({"kind": "sent", "start": offset + start,
+                              "end": offset + start + len(sent), "src": sent,
                               "wants": wants})
+
+    for line_m in re.finditer(r"[^\n]+", text):
+        line = line_m.group(0)
+        if "[[CODE_" in line:
+            continue
+        b = BULLET_RE.match(line)
+        if b:                           # bullet: task the item body only
+            scan(b.group(2), line_m.start() + len(b.group(1)))
+            continue
+        if line.lstrip().startswith(("#", "|", ">")):
+            continue                    # headings/tables/quotes stay verbatim
+        scan(line, line_m.start())
     return tasks
 
 
@@ -377,11 +398,14 @@ def run_term_task(task):
 
 
 def run_sent_task(task):
+    # generous runaway guard: Korean tokenizes to ~4.5 tok/char, so this
+    # never truncates a faithful answer but stops a pathological loop
+    cap = len(task["src"]) * 6 + 48
     out = call_ollama(
         "너는 한국어 문장 교정기다. 지시받은 것만 고치고 다른 단어는 바꾸지 "
         "않는다. 고친 문장만 출력한다. 설명을 붙이지 않는다.\n지시: "
         + "; ".join(task["wants"]),
-        task["src"])
+        task["src"], num_predict=cap)
     out = clean_output(out).strip()
     if not out or missing_numbers(task["src"], out):
         return None
@@ -437,7 +461,8 @@ def apply_merges(text, results):
 
 
 def run_wave(tasks, runner):
-    workers = max(1, min(int(CFG["parallel_chunks"]), len(tasks)))
+    # micro-tasks are small enough for ollama to actually run concurrently
+    workers = max(1, min(int(CFG["parallel_tasks"]), len(tasks)))
     if not tasks:
         return []
     if workers == 1:
