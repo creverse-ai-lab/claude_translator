@@ -39,7 +39,8 @@ def load_config():
         "ollama_url": "http://127.0.0.1:11434",
         "model": "gemma4:e2b",
         "prompt_file": "prompt.en.md",
-        "mode": "dispatch",        # dispatch: detect->micro-tasks->merge
+        "mode": "regex",           # regex: 정규식만, 스트리밍 유지, 모델 없음
+                                   # dispatch: detect->micro-tasks->merge
                                    # rewrite: legacy whole-chunk rewriting
         "keep_alive": "30m",
         "temperature": 0.0,
@@ -219,8 +220,9 @@ FILLER_OPENER_RE = re.compile(
     r"(?:결론부터 말하면[,]?\s*|결론은\s*)?")
 
 
-def apply_mechanical(text):
-    text = FILLER_OPENER_RE.sub("", text, count=1)
+def apply_mechanical(text, at_start=True):
+    if at_start:
+        text = FILLER_OPENER_RE.sub("", text, count=1)
     text = SHRINK_RE.sub(r"\1분의 1로\2\3", text)
     for pat, rep in DOUBLE_PASSIVE + FIXED_PHRASES + PORTED_PHRASES:
         text = pat.sub(rep, text)
@@ -271,6 +273,41 @@ def unmask_code(text, blocks):
                " 모아둡니다. 원문에서의 위치는 위 본문을 참고하세요.)\n\n"
         out += "\n\n".join(blocks[i] for i in missing)
     return out
+
+
+# ------------------------------------------------ regex streaming mode
+# No model at all: every delta is transformed by the regex layer and shown
+# immediately, so streaming stays live. Code fences are tracked across
+# deltas via the part buffer; fenced lines pass through untouched.
+
+
+def fence_parity_before(directory, index, wait_sec=0.5):
+    """Number of ``` fences seen in flushes 0..index-1 (odd = inside)."""
+    text = collect_parts(directory, index - 1, wait_sec) if index else ""
+    return text.count("```") % 2
+
+
+def regex_transform(delta, inside_fence, at_start):
+    out_lines = []
+    for line in delta.split("\n"):
+        if line.lstrip().startswith("```"):
+            inside_fence = not inside_fence
+            out_lines.append(line)
+            continue
+        if inside_fence:
+            out_lines.append(line)
+            continue
+        masked, blocks = [], []
+        def take(m):
+            blocks.append(m.group(0))
+            return "[[CODE_%d]]" % (len(blocks) - 1)
+        body = INLINE_RE.sub(take, line)
+        body = apply_mechanical(body, at_start=at_start)
+        at_start = False
+        body = re.sub(r"\[\[CODE_(\d+)\]\]",
+                      lambda m: blocks[int(m.group(1))], body)
+        out_lines.append(body)
+    return "\n".join(out_lines), inside_fence
 
 
 # ---------------------------------------------------- dispatch pipeline
@@ -873,6 +910,20 @@ def main():
     except Exception as exc:
         log("write_part failed: %s" % exc)
         emit(delta)
+
+    if CFG["mode"] == "regex":
+        inside = fence_parity_before(directory, index) == 1
+        shown, _ = regex_transform(delta, inside, at_start=(index == 0))
+        if is_final:
+            try:
+                full = collect_parts(directory, index, CFG["part_wait_sec"])
+                with_actions = collect_actions(full)
+                if len(with_actions) > len(full):
+                    shown += with_actions[len(full):]
+            except Exception as exc:
+                log("action block failed: %s" % exc)
+            prune_old_buffers()
+        emit(shown)
 
     if not is_final:
         emit("")          # hide the raw stream; the final flush prints it all

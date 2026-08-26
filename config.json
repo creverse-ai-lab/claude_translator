@@ -20,7 +20,7 @@
   "prompt_file": "prompt.en.md",
   "collect_actions": true,
   "actions_min": 2,
-  "mode": "dispatch",
+  "mode": "regex",
   "parallel_tasks": 6,
   "gloss_terms": "slang"
 }

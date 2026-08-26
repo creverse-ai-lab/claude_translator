@@ -56,7 +56,21 @@ Claude Code의 `MessageDisplay` 훅 이벤트를 사용합니다. 이 이벤트�
 대화 기록과 모델 입력은 바뀌지 않습니다. 스트리밍 중에는 화면이 비어 있고,
 마지막 실행에서 완성본이 한 번에 나타납니다.
 
-### 파이프라인 (기본값: dispatch 모드)
+### 파이프라인 (기본값: regex 모드)
+
+**2026-08-26 방향 전환**: 소형 LLM 윤문 층은 실측 결과 비용(RAM·지연·빈
+화면·왜곡 위험) 대비 효과가 얇았습니다. 복잡도와 말투의 근본 해결은 **생성
+시점**으로 옮겼습니다 — `output-styles/korean-analyst.md` (결론 먼저, 낮은
+복잡도, 자연스러운 한국어)를 Claude의 output style로 적용하고, 훅은 모델
+없는 regex 모드가 기본입니다.
+
+**regex 모드**: delta가 올 때마다 정규식 층만 통과시켜 **즉시 표시** —
+스트리밍이 살아 있고, 지연·RAM이 0입니다. 코드 펜스는 파트 버퍼로 경계를
+추적해 건드리지 않습니다. 행동 항목 모음은 마지막 flush에 붙습니다.
+
+`mode` 설정으로 이전 모드도 쓸 수 있습니다:
+
+### dispatch 모드 (옵션)
 
 > 탐지는 파이썬이, 소형 모델은 쪼개진 마이크로 태스크만, 종합은 다시 파이썬이.
 
@@ -96,6 +110,7 @@ Claude 답변 (완성본)
 | `hooks/prompt.ko.md` | 약 2.4KB | 같은 내용의 한국어판 (비교용) |
 | `config.json` | 약 0.5KB | 기본 설정 (아래 표) |
 | `install.sh` / `uninstall.sh` | 약 4.5KB | 설치·제거 스크립트 |
+| `output-styles/korean-analyst.md` | 약 1.7KB | Claude output style — 결론 먼저·낮은 복잡도·자연스러운 한국어. `~/.claude/output-styles/`에 복사해서 사용 |
 | `README.md` | 이 문서 | |
 
 실행 시 생기는 것 (저장소 밖, `~/.claude/message-display-translator/`):
@@ -131,7 +146,7 @@ Claude 답변 (완성본)
 | `mark_chunks` | `false` | 조각 경계에 `---` 표시 |
 | `keep_original` | `true` | 비교 모드: 원문과 결과를 위아래로 둘 다 표시 |
 | `part_wait_sec` | `3.0` | 마지막 실행이 형제 조각을 기다리는 시간 |
-| `mode` | `dispatch` | `dispatch`: 탐지→분배→종합. `rewrite`: 조각 단위 전체 다시 쓰기 |
+| `mode` | `regex` | `regex`: 정규식만, 스트리밍 유지 (기본). `dispatch`: 탐지→분배→종합. `rewrite`: 조각 재작성 |
 | `prompt_file` | `prompt.en.md` | rewrite 모드가 쓰는 프롬프트 파일 |
 | `debug` | `false` | 로그·조각 덤프 기록 |
 
