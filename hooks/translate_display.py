@@ -563,7 +563,8 @@ def run_wave(tasks, runner):
 
 
 def translate_dispatch(text):
-    masked, blocks = mask_code(apply_mechanical(text))
+    masked, blocks = mask_code(text)      # mask FIRST - quoted patterns
+    masked = apply_mechanical(masked)     # inside backticks must survive
     terms = find_term_tasks(masked)
     log("dispatch: %d term task(s): %s"
         % (len(terms), [t["src"] for t in terms]))
@@ -783,7 +784,8 @@ def translate(text):
     if CFG["mode"] == "dispatch":
         return translate_dispatch(text)
     system_prompt = read_prompt()
-    masked, blocks = mask_code(apply_mechanical(text))
+    masked, blocks = mask_code(text)
+    masked = apply_mechanical(masked)
     chunks = split_chunks(masked, CFG["max_chunk_chars"],
                           CFG["min_chunk_chars"])
     log("chunks=%d sizes=%s" % (len(chunks), [len(c) for c in chunks]))
