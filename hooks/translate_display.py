@@ -50,6 +50,7 @@ def load_config():
         "min_chunk_chars": 400,    # do not leave a lonely tail chunk
         "parallel_chunks": 3,      # chunks translated at the same time
         "parallel_tasks": 6,       # concurrent micro-tasks (dispatch mode)
+        "gloss_terms": "slang",    # slang: 영어어근+한국어어미만 / all / off
         "mark_chunks": False,      # draw a line where each chunk split
         "min_output_ratio": 0.6,   # reject a rewrite shorter than this
         "max_retries": 1,          # retries before keeping the original
@@ -278,40 +279,59 @@ def unmask_code(text, blocks):
 # The model never holds the whole text, so it can neither summarize nor
 # hallucinate structure - the failure modes we measured in whole-chunk mode.
 
-# bare-English term runs (code is already masked away at this point)
+# Claude-slang: an English root inflected with a Korean ending
+# ("robust한", "graceful하게", "flaky할 수"). Bare English nouns (mutex,
+# failover) read fine for a developer and are deliberately left alone -
+# blanket glossing was tried and turned out to be noise.
+SLANG_RE = re.compile(
+    r"[A-Za-z][A-Za-z+#.-]*"
+    r"(?:스러운|스럽게|하게|하지|하다|하며|하고|해서|해도|합니다|했|한|할|함|해)"
+    r"(?=[\s,.)]|$)")
+
+# gloss scope: "slang" (default) / "all" (every bare English term) / "off"
+SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+CONNECTIVE_RE = re.compile(r"(?:았|었|이|하)?(?:고|는데|아서|어서|으며|지만),?\s")
+
+
 ENG_RUN_RE = re.compile(
     r"[A-Za-z][A-Za-z0-9+#.'-]*(?:[ -][A-Za-z][A-Za-z0-9+#.'-]*)*")
-
-# industry-standard tokens never worth translating (im-not-ai Do-NOT list)
 TERM_SKIP = {
     "api", "cpu", "gpu", "ram", "llm", "gpt", "mcp", "sdk", "cli", "url",
     "http", "https", "json", "yaml", "sql", "db", "id", "ui", "ux", "os",
     "ci", "cd", "pr", "npm", "pip", "git", "ok",
 }
 
-SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
-CONNECTIVE_RE = re.compile(r"(?:았|었|이|하)?(?:고|는데|아서|어서|으며|지만),?\s")
-
 
 def find_term_tasks(text):
-    """First occurrence of each bare English term worth glossing."""
+    """Claude-slang spans (영어 어근+한국어 어미) - first occurrence each."""
     tasks, seen = [], set()
+    scope = CFG["gloss_terms"]
+    if scope == "off":
+        return tasks
+    if scope == "slang":
+        for m in SLANG_RE.finditer(text):
+            key = m.group(0).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            tasks.append({"kind": "slang", "start": m.start(),
+                          "end": m.end(), "src": m.group(0)})
+        return tasks
+    # scope == "all": the old blanket behaviour, kept as an option
     for m in ENG_RUN_RE.finditer(text):
         t = m.group(0)
         words = t.split()
         if len(t) < 4 and len(words) == 1:
-            continue                    # too short to be a term
+            continue
         if t.isupper():
-            continue                    # acronym - industry standard
+            continue
         if len(words) == 1 and (t[0].isupper() or t.lower() in TERM_SKIP):
-            continue                    # proper noun or standard token
-        if any(w.lower() in TERM_SKIP for w in words) and len(words) == 1:
             continue
         if text[max(0, m.start() - 1):m.start()] == "(":
-            continue                    # already glossed: 한국어(term)
+            continue
         key = t.lower()
         if key in seen:
-            continue                    # B-1: gloss first occurrence only
+            continue
         seen.add(key)
         tasks.append({"kind": "term", "start": m.start(), "end": m.end(),
                       "src": t})
@@ -364,6 +384,16 @@ def find_sentence_tasks(text):
     return tasks
 
 
+SLANG_FEWSHOT = [
+    {"role": "user", "content": "영어 어근에 한국어 어미가 붙은 표현을 자연스러운 "
+                                "한국어로 바꿔 답해. 답만 한 줄.\n표현: robust한"},
+    {"role": "assistant", "content": "안정적인"},
+    {"role": "user", "content": "표현: graceful하게"},
+    {"role": "assistant", "content": "매끄럽게"},
+    {"role": "user", "content": "표현: flaky할"},
+    {"role": "assistant", "content": "불안정할"},
+]
+
 TERM_FEWSHOT = [
     {"role": "user", "content": "소프트웨어 용어의 한국어 번역어만 답해.\n"
                                 "용어: garbage collection"},
@@ -380,11 +410,14 @@ TERM_ANSWER_RE = re.compile(r"^[가-힣][가-힣0-9· ]{0,24}$")
 
 def run_term_task(task):
     """Few-shot micro-call: the model answers with the Korean only and
-    Python assembles the `한국어(원어)` gloss - measured 11/12 vs 9/12 for
-    the ask-for-the-full-format prompt, and several times faster."""
+    Python assembles the `한국어(원어)` gloss."""
+    if task["kind"] == "slang":
+        fewshot, label = SLANG_FEWSHOT, "표현: "
+    else:
+        fewshot, label = TERM_FEWSHOT, "용어: "
     out = call_ollama(None, None,
-                      messages=TERM_FEWSHOT + [
-                          {"role": "user", "content": "용어: " + task["src"]}],
+                      messages=fewshot + [
+                          {"role": "user", "content": label + task["src"]}],
                       num_predict=24, stop=["\n"], num_ctx=1024)
     out = clean_output(out).strip().strip('"').rstrip(".")
     # strip a parenthesized echo of the source term if the model added one
@@ -394,7 +427,9 @@ def run_term_task(task):
         return None
     if out.replace(" ", "").lower() == task["src"].replace(" ", "").lower():
         return None                     # model echoed the term - keep as-is
-    return "%s(%s)" % (out, task["src"])
+    root = re.match(r"[A-Za-z+#.-]+", task["src"])
+    orig = root.group(0) if task["kind"] == "slang" and root else task["src"]
+    return "%s(%s)" % (out, orig)
 
 
 def run_sent_task(task):
@@ -455,7 +490,7 @@ def apply_merges(text, results):
         if out is None:
             continue
         text = text[:task["start"]] + out + text[task["end"]:]
-        if task["kind"] == "term":
+        if task["kind"] in ("term", "slang"):
             text = fix_particle(text, task["start"] + len(out))
     return text
 

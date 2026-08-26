@@ -21,5 +21,6 @@
   "collect_actions": true,
   "actions_min": 2,
   "mode": "dispatch",
-  "parallel_tasks": 6
+  "parallel_tasks": 6,
+  "gloss_terms": "slang"
 }
