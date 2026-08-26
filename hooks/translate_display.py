@@ -425,6 +425,10 @@ def run_term_task(task):
     if not TERM_ANSWER_RE.match(out):
         log("term task rejected %r -> %r" % (task["src"], out))
         return None
+    if re.search(r"않|없", out) and not re.search(r"않|없", task["src"]):
+        log("term task rejected (negation added) %r -> %r"
+            % (task["src"], out))
+        return None
     if out.replace(" ", "").lower() == task["src"].replace(" ", "").lower():
         return None                     # model echoed the term - keep as-is
     root = re.match(r"[A-Za-z+#.-]+", task["src"])
@@ -447,6 +451,10 @@ def run_sent_task(task):
     ratio = len(out) / max(1, len(task["src"]))
     if not 0.7 <= ratio <= 1.9:
         log("sent task rejected (ratio %.2f): %r" % (ratio, task["src"][:40]))
+        return None
+    if any("합니다" in w for w in task["wants"]) and \
+            not re.search(r"(니다|시오)[.!?]\s*$", out.strip()):
+        log("sent task rejected (register): %r" % out[-20:])
         return None
     if re.search(r"\[\[\s*CODE_", task["src"]) and \
             sorted(PLACEHOLDER_RE.findall(task["src"])) != \
