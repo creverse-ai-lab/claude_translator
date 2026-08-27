@@ -224,7 +224,8 @@ PORTED_PHRASES = [
 # a first sentence that says nothing - drop it and start at the conclusion
 FILLER_OPENER_RE = re.compile(
     r"^\s*(?:네[,.!]?\s*)?(?:조사해\s?봤습니다|확인해\s?봤습니다|확인했습니다|"
-    r"알겠습니다|살펴봤습니다|검토해\s?봤습니다)[.!]?\s*"
+    r"알겠습니다|살펴봤습니다|검토해\s?봤습니다|"
+    r"핵심 사실 하나를? 먼저 말합니다)[.!]?\s*"
     r"(?:결론부터 말하면[,]?\s*|결론은\s*)?")
 
 
